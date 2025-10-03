@@ -67,8 +67,8 @@ def prepare_element_features(element_csv):
     """Prepare element feature vectors"""
     element_df = pd.read_csv(element_csv)
     
-    features = element_df[['Atomic number', 'Group', 'Period', 'Density',
-                           'Electronegativity', 'UE', 'Ionisation Energy', 'Atomic radius']]
+    features = element_df[['AtomicNumber', 'Group', 'Period', 'Density',
+                           'Electronegativity', 'UE', 'IonizationEnergy', 'AtomicRadius']]
     
     scaled_features = StandardScaler().fit_transform(features)
     squared_features = np.square(scaled_features)
