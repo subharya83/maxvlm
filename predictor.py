@@ -2,38 +2,116 @@
 """
 Materials Property Predictor CLI
 Predicts magnetic ordering, magnetic moment, and formation energy for materials
+
+This module provides a command-line interface for making predictions using
+pre-trained LightGBM models. It expects feature vectors of dimension 518,
+computed using the pipeline.py feature extraction module.
+
+Feature Vector Composition (518 dimensions):
+    - 256: Flattened mean of outer product matrices (16x16)
+    - 256: Flattened std of outer product matrices (16x16)
+    - 2: Distance statistics (mean, std)
+    - 2: Electronegativity difference statistics (mean, std)
+    - 2: Squared electronegativity difference statistics (mean, std)
+
+Models:
+    - Magnetic Ordering: Binary classification (FM vs FiM)
+    - Magnetic Moment: Regression (μB/atom)
+    - Formation Energy: Regression (eV/atom)
+
+Author: Materials Prediction Pipeline
+Version: 2.0
 """
 
 import argparse
 import sys
 import os
 import pickle
+import json
 import pandas as pd
 import numpy as np
 from pathlib import Path
+from typing import Dict, List, Optional, Union, Any
+import logging
+
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+class ModelLoadError(Exception):
+    """Raised when models cannot be loaded properly"""
+    pass
+
+
+class FeatureValidationError(Exception):
+    """Raised when feature dimensions or format are invalid"""
+    pass
+
 
 class MaterialsPredictor:
-    def __init__(self, weights_dir='weights'):
+    """
+    Materials property predictor using pre-trained LightGBM models.
+    
+    This class loads trained models and provides methods to predict:
+    1. Magnetic ordering (FM or FiM)
+    2. Magnetic moment per atom
+    3. Formation energy per atom
+    
+    Attributes:
+        weights_dir (Path): Directory containing model weights
+        models (Dict): Dictionary of loaded models
+        element_df (Optional[pd.DataFrame]): Element feature database
+        expected_features (int): Expected number of input features (518)
+    """
+    
+    EXPECTED_FEATURES = 518
+    VALID_SPLITS = ['90_10', '70_30']
+    VALID_TASKS = ['all', 'ordering', 'moment', 'formation']
+    
+    def __init__(self, weights_dir: str = 'weights'):
+        """
+        Initialize the predictor by loading all models.
+        
+        Args:
+            weights_dir: Directory containing model weights
+            
+        Raises:
+            ModelLoadError: If weights directory doesn't exist or no models found
+        """
         self.weights_dir = Path(weights_dir)
-        self.models = {}
-        self.element_df = None
+        self.models: Dict[str, Any] = {}
+        self.element_df: Optional[pd.DataFrame] = None
         self.load_all_models()
         
-    def load_all_models(self):
-        """Load all trained models and element data"""
-        if not self.weights_dir.exists():
-            print(f"Error: Weights directory '{self.weights_dir}' not found.")
-            print("Please run train_models.py first to generate model weights.")
-            sys.exit(1)
+    def load_all_models(self) -> None:
+        """
+        Load all trained models and element data.
         
-        # Load element feature data
+        Raises:
+            ModelLoadError: If critical files are missing
+        """
+        if not self.weights_dir.exists():
+            raise ModelLoadError(
+                f"Weights directory '{self.weights_dir}' not found. "
+                "Please run trainer.py first to generate model weights."
+            )
+        
+        # Load element feature data (optional)
         element_path = self.weights_dir / 'element_features.pkl'
         if element_path.exists():
-            with open(element_path, 'rb') as f:
-                self.element_df = pickle.load(f)
-            print(f"Loaded element features: {len(self.element_df)} elements")
+            try:
+                with open(element_path, 'rb') as f:
+                    self.element_df = pickle.load(f)
+                logger.info(f"Loaded element features: {len(self.element_df)} elements")
+            except Exception as e:
+                logger.warning(f"Could not load element features: {e}")
         else:
-            print("Warning: Element features not found")
+            logger.warning("Element features not found (optional)")
         
         # Load models
         model_files = {
@@ -45,202 +123,380 @@ class MaterialsPredictor:
             'formation_70_30': 'formation_energy_model_70_30.pkl',
         }
         
+        loaded_count = 0
         for name, filename in model_files.items():
             model_path = self.weights_dir / filename
             if model_path.exists():
-                with open(model_path, 'rb') as f:
-                    self.models[name] = pickle.load(f)
-                print(f"Loaded model: {name}")
+                try:
+                    with open(model_path, 'rb') as f:
+                        self.models[name] = pickle.load(f)
+                    logger.info(f"Loaded model: {name}")
+                    loaded_count += 1
+                except Exception as e:
+                    logger.error(f"Error loading {name}: {e}")
         
-        if not self.models:
-            print("Error: No models found. Please train models first.")
-            sys.exit(1)
+        if loaded_count == 0:
+            raise ModelLoadError(
+                "No models found. Please train models first using trainer.py"
+            )
+        
+        logger.info(f"Successfully loaded {loaded_count}/{len(model_files)} models")
     
-    def predict_ordering(self, features, split='90_10'):
-        """Predict magnetic ordering (FM or FiM)"""
+    def _validate_features(self, features: np.ndarray) -> None:
+        """
+        Validate feature array dimensions and format.
+        
+        Args:
+            features: Feature array to validate
+            
+        Raises:
+            FeatureValidationError: If features are invalid
+        """
+        if not isinstance(features, np.ndarray):
+            raise FeatureValidationError(
+                f"Features must be numpy array, got {type(features)}"
+            )
+        
+        if features.ndim != 2:
+            raise FeatureValidationError(
+                f"Features must be 2D array (samples, features), got shape {features.shape}"
+            )
+        
+        if features.shape[1] != self.EXPECTED_FEATURES:
+            raise FeatureValidationError(
+                f"Expected {self.EXPECTED_FEATURES} features, got {features.shape[1]}. "
+                "Ensure features are computed using the same pipeline configuration."
+            )
+        
+        if np.isnan(features).any():
+            raise FeatureValidationError("Features contain NaN values")
+        
+        if np.isinf(features).any():
+            raise FeatureValidationError("Features contain infinite values")
+    
+    def predict_ordering(
+        self, 
+        features: np.ndarray, 
+        split: str = '90_10'
+    ) -> Optional[Dict[str, Union[str, float, Dict[str, float]]]]:
+        """
+        Predict magnetic ordering (FM or FiM).
+        
+        Args:
+            features: Feature array of shape (n_samples, 518)
+            split: Model split to use ('90_10' or '70_30')
+            
+        Returns:
+            Dictionary containing:
+                - ordering: Predicted class ('FM' or 'FiM')
+                - confidence: Prediction confidence [0, 1]
+                - probabilities: Dict with probabilities for each class
+            Returns None if prediction fails
+            
+        Raises:
+            FeatureValidationError: If features are invalid
+        """
         model_key = f'ordering_{split}'
         if model_key not in self.models:
-            print(f"Error: Model {model_key} not found")
+            logger.error(f"Model {model_key} not found")
             return None
         
-        model = self.models[model_key]
-        prediction = model.predict(features)
-        probabilities = model.predict_proba(features)
-        
-        # 0: FM, 1: FiM
-        label = 'FM' if prediction[0] == 0 else 'FiM'
-        confidence = probabilities[0][prediction[0]]
-        
-        return {
-            'ordering': label,
-            'confidence': confidence,
-            'probabilities': {'FM': probabilities[0][0], 'FiM': probabilities[0][1]}
-        }
+        try:
+            self._validate_features(features)
+            model = self.models[model_key]
+            
+            prediction = model.predict(features)
+            probabilities = model.predict_proba(features)
+            
+            # 0: FM, 1: FiM
+            label = 'FM' if prediction[0] == 0 else 'FiM'
+            confidence = float(probabilities[0][prediction[0]])
+            
+            return {
+                'ordering': label,
+                'confidence': confidence,
+                'probabilities': {
+                    'FM': float(probabilities[0][0]), 
+                    'FiM': float(probabilities[0][1])
+                }
+            }
+        except Exception as e:
+            logger.error(f"Prediction error: {e}")
+            return None
     
-    def predict_moment(self, features, split='90_10'):
-        """Predict magnetic moment per atom"""
+    def predict_moment(
+        self, 
+        features: np.ndarray, 
+        split: str = '90_10'
+    ) -> Optional[Dict[str, Union[float, str]]]:
+        """
+        Predict magnetic moment per atom.
+        
+        Args:
+            features: Feature array of shape (n_samples, 518)
+            split: Model split to use ('90_10' or '70_30')
+            
+        Returns:
+            Dictionary containing:
+                - magnetic_moment: Predicted moment value
+                - unit: 'μB/atom'
+            Returns None if prediction fails
+            
+        Raises:
+            FeatureValidationError: If features are invalid
+        """
         model_key = f'moment_{split}'
         if model_key not in self.models:
-            print(f"Error: Model {model_key} not found")
+            logger.error(f"Model {model_key} not found")
             return None
         
-        model = self.models[model_key]
-        prediction = model.predict(features)
-        
-        return {
-            'magnetic_moment': prediction[0],
-            'unit': 'μB/atom'
-        }
+        try:
+            self._validate_features(features)
+            model = self.models[model_key]
+            prediction = model.predict(features)
+            
+            return {
+                'magnetic_moment': float(prediction[0]),
+                'unit': 'μB/atom'
+            }
+        except Exception as e:
+            logger.error(f"Prediction error: {e}")
+            return None
     
-    def predict_formation_energy(self, features, split='90_10'):
-        """Predict formation energy per atom"""
+    def predict_formation_energy(
+        self, 
+        features: np.ndarray, 
+        split: str = '90_10'
+    ) -> Optional[Dict[str, Union[float, str]]]:
+        """
+        Predict formation energy per atom.
+        
+        Args:
+            features: Feature array of shape (n_samples, 518)
+            split: Model split to use ('90_10' or '70_30')
+            
+        Returns:
+            Dictionary containing:
+                - formation_energy: Predicted energy value
+                - unit: 'eV/atom'
+            Returns None if prediction fails
+            
+        Raises:
+            FeatureValidationError: If features are invalid
+        """
         model_key = f'formation_{split}'
         if model_key not in self.models:
-            print(f"Error: Model {model_key} not found")
+            logger.error(f"Model {model_key} not found")
             return None
         
-        model = self.models[model_key]
-        prediction = model.predict(features)
-        
-        return {
-            'formation_energy': prediction[0],
-            'unit': 'eV/atom'
-        }
+        try:
+            self._validate_features(features)
+            model = self.models[model_key]
+            prediction = model.predict(features)
+            
+            return {
+                'formation_energy': float(prediction[0]),
+                'unit': 'eV/atom'
+            }
+        except Exception as e:
+            logger.error(f"Prediction error: {e}")
+            return None
     
-    def predict_from_features_file(self, features_file, task='all', split='90_10'):
-        """Make predictions from a pre-computed features file"""
+    def predict_from_features_file(
+        self, 
+        features_file: str, 
+        task: str = 'all', 
+        split: str = '90_10'
+    ) -> Optional[List[Dict[str, Any]]]:
+        """
+        Make predictions from a pre-computed features file.
+        
+        Args:
+            features_file: Path to features file (.pkl or .csv)
+            task: Prediction task ('all', 'ordering', 'moment', 'formation')
+            split: Model split to use ('90_10' or '70_30')
+            
+        Returns:
+            List of prediction dictionaries, one per material
+            Returns None if loading or prediction fails
+        """
+        # Validate inputs
+        if task not in self.VALID_TASKS:
+            logger.error(f"Invalid task: {task}. Must be one of {self.VALID_TASKS}")
+            return None
+        
+        if split not in self.VALID_SPLITS:
+            logger.error(f"Invalid split: {split}. Must be one of {self.VALID_SPLITS}")
+            return None
+        
         # Load features
-        if features_file.endswith('.pkl'):
-            with open(features_file, 'rb') as f:
-                data = pickle.load(f)
-        elif features_file.endswith('.csv'):
-            data = pd.read_csv(features_file)
-            # Assume first column is material_id, rest are features
-            if 'material_id' in data.columns:
-                material_ids = data['material_id'].values
-                features = data.drop('material_id', axis=1).values
+        try:
+            if features_file.endswith('.pkl'):
+                with open(features_file, 'rb') as f:
+                    data = pickle.load(f)
+            elif features_file.endswith('.csv'):
+                data = pd.read_csv(features_file)
             else:
-                material_ids = [f"material_{i}" for i in range(len(data))]
-                features = data.values
-        else:
-            print("Error: Unsupported file format. Use .pkl or .csv")
+                logger.error("Unsupported file format. Use .pkl or .csv")
+                return None
+        except Exception as e:
+            logger.error(f"Error loading features file: {e}")
             return None
         
         results = []
         
-        # Handle pickle format
+        # Handle pickle format (DataFrame with 'features' column)
         if isinstance(data, pd.DataFrame) and 'features' in data.columns:
+            logger.info(f"Processing {len(data)} materials from pickle format")
+            
             for idx, row in data.iterrows():
                 material_id = row.get('material_id', f'material_{idx}')
-                feature_vector = np.array(row['features']).reshape(1, -1)
                 
-                result = {'material_id': material_id}
-                
-                if task in ['all', 'ordering']:
-                    result['ordering'] = self.predict_ordering(feature_vector, split)
-                if task in ['all', 'moment']:
-                    result['moment'] = self.predict_moment(feature_vector, split)
-                if task in ['all', 'formation']:
-                    result['formation'] = self.predict_formation_energy(feature_vector, split)
-                
-                results.append(result)
+                try:
+                    feature_vector = np.array(row['features']).reshape(1, -1)
+                    result = self._predict_single(material_id, feature_vector, task, split)
+                    results.append(result)
+                except Exception as e:
+                    logger.error(f"Error predicting {material_id}: {e}")
+                    results.append({'material_id': material_id, 'error': str(e)})
         
-        # Handle CSV format
+        # Handle CSV format (flattened features as columns)
         elif isinstance(data, pd.DataFrame):
+            logger.info(f"Processing {len(data)} materials from CSV format")
+            
             feature_cols = [col for col in data.columns if col != 'material_id']
+            
+            if len(feature_cols) != self.EXPECTED_FEATURES:
+                logger.warning(
+                    f"Expected {self.EXPECTED_FEATURES} feature columns, "
+                    f"found {len(feature_cols)}"
+                )
+            
             for idx, row in data.iterrows():
                 material_id = row.get('material_id', f'material_{idx}')
-                feature_vector = row[feature_cols].values.reshape(1, -1)
                 
-                result = {'material_id': material_id}
-                
-                if task in ['all', 'ordering']:
-                    result['ordering'] = self.predict_ordering(feature_vector, split)
-                if task in ['all', 'moment']:
-                    result['moment'] = self.predict_moment(feature_vector, split)
-                if task in ['all', 'formation']:
-                    result['formation'] = self.predict_formation_energy(feature_vector, split)
-                
-                results.append(result)
+                try:
+                    feature_vector = row[feature_cols].values.reshape(1, -1)
+                    result = self._predict_single(material_id, feature_vector, task, split)
+                    results.append(result)
+                except Exception as e:
+                    logger.error(f"Error predicting {material_id}: {e}")
+                    results.append({'material_id': material_id, 'error': str(e)})
+        else:
+            logger.error(f"Unsupported data format: {type(data)}")
+            return None
         
         return results
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description='Predict magnetic and energetic properties of materials',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Predict all properties using 90:10 split model
-  python predict_materials.py --features data/features.pkl --task all --split 90_10
-  
-  # Predict only magnetic ordering
-  python predict_materials.py --features data/features.csv --task ordering
-  
-  # Predict formation energy using 70:30 split model
-  python predict_materials.py --features data/features.pkl --task formation --split 70_30
-  
-  # Save output to file
-  python predict_materials.py --features data/features.pkl --output predictions.json
+    
+    def _predict_single(
+        self, 
+        material_id: str, 
+        features: np.ndarray, 
+        task: str, 
+        split: str
+    ) -> Dict[str, Any]:
         """
-    )
+        Make predictions for a single material.
+        
+        Args:
+            material_id: Material identifier
+            features: Feature vector
+            task: Prediction task
+            split: Model split
+            
+        Returns:
+            Dictionary with material_id and predictions
+        """
+        result = {'material_id': material_id}
+        
+        if task in ['all', 'ordering']:
+            result['ordering'] = self.predict_ordering(features, split)
+        
+        if task in ['all', 'moment']:
+            result['moment'] = self.predict_moment(features, split)
+        
+        if task in ['all', 'formation']:
+            result['formation'] = self.predict_formation_energy(features, split)
+        
+        return result
+
+
+def save_results(results: List[Dict], output_file: str) -> None:
+    """
+    Save prediction results to file.
     
-    parser.add_argument('--features', required=True,
-                       help='Path to features file (.pkl or .csv)')
-    parser.add_argument('--task', choices=['all', 'ordering', 'moment', 'formation'],
-                       default='all',
-                       help='Prediction task (default: all)')
-    parser.add_argument('--split', choices=['90_10', '70_30'],
-                       default='90_10',
-                       help='Train/test split model to use (default: 90_10)')
-    parser.add_argument('--weights-dir', default='weights',
-                       help='Directory containing model weights (default: weights)')
-    parser.add_argument('--output', '-o',
-                       help='Output file for predictions (.json or .csv)')
-    parser.add_argument('--verbose', '-v', action='store_true',
-                       help='Verbose output')
+    Args:
+        results: List of prediction dictionaries
+        output_file: Output file path (.json or .csv)
+    """
+    try:
+        if output_file.endswith('.json'):
+            with open(output_file, 'w') as f:
+                json.dump(results, f, indent=2)
+            logger.info(f"Results saved to {output_file}")
+        
+        elif output_file.endswith('.csv'):
+            # Flatten results for CSV
+            flat_results = []
+            for result in results:
+                flat = {'material_id': result['material_id']}
+                
+                if 'error' in result:
+                    flat['error'] = result['error']
+                
+                if 'ordering' in result and result['ordering']:
+                    flat['ordering'] = result['ordering']['ordering']
+                    flat['ordering_confidence'] = result['ordering']['confidence']
+                    flat['prob_FM'] = result['ordering']['probabilities']['FM']
+                    flat['prob_FiM'] = result['ordering']['probabilities']['FiM']
+                
+                if 'moment' in result and result['moment']:
+                    flat['magnetic_moment'] = result['moment']['magnetic_moment']
+                
+                if 'formation' in result and result['formation']:
+                    flat['formation_energy'] = result['formation']['formation_energy']
+                
+                flat_results.append(flat)
+            
+            df = pd.DataFrame(flat_results)
+            df.to_csv(output_file, index=False)
+            logger.info(f"Results saved to {output_file}")
+        
+        else:
+            logger.error("Unsupported output format. Use .json or .csv")
     
-    args = parser.parse_args()
+    except Exception as e:
+        logger.error(f"Error saving results: {e}")
+
+
+def display_results(results: List[Dict], verbose: bool = False, max_display: int = 10) -> None:
+    """
+    Display prediction results to console.
     
-    # Check if features file exists
-    if not os.path.exists(args.features):
-        print(f"Error: Features file '{args.features}' not found")
-        sys.exit(1)
-    
-    # Initialize predictor
-    print(f"\nInitializing Materials Predictor...")
-    print(f"Weights directory: {args.weights_dir}")
-    print(f"Model split: {args.split}")
-    print(f"Task: {args.task}\n")
-    
-    predictor = MaterialsPredictor(weights_dir=args.weights_dir)
-    
-    # Make predictions
-    print(f"Making predictions from {args.features}...")
-    results = predictor.predict_from_features_file(
-        args.features,
-        task=args.task,
-        split=args.split
-    )
-    
-    if results is None:
-        print("Error: Failed to make predictions")
-        sys.exit(1)
-    
-    # Display results
+    Args:
+        results: List of prediction dictionaries
+        verbose: Show detailed probabilities
+        max_display: Maximum number of results to display
+    """
     print(f"\n{'='*80}")
     print(f"PREDICTION RESULTS ({len(results)} materials)")
     print(f"{'='*80}\n")
     
-    for i, result in enumerate(results[:10]):  # Show first 10
+    success_count = sum(1 for r in results if 'error' not in r)
+    if success_count < len(results):
+        print(f"⚠ {len(results) - success_count} predictions failed\n")
+    
+    for i, result in enumerate(results[:max_display]):
         print(f"Material: {result['material_id']}")
+        
+        if 'error' in result:
+            print(f"  ❌ Error: {result['error']}")
         
         if 'ordering' in result and result['ordering']:
             ord_result = result['ordering']
             print(f"  Magnetic Ordering: {ord_result['ordering']} "
                   f"(confidence: {ord_result['confidence']:.3f})")
-            if args.verbose:
+            if verbose:
                 print(f"    Probabilities: FM={ord_result['probabilities']['FM']:.3f}, "
                       f"FiM={ord_result['probabilities']['FiM']:.3f}")
         
@@ -254,44 +510,96 @@ Examples:
         
         print()
     
-    if len(results) > 10:
-        print(f"... and {len(results) - 10} more materials\n")
+    if len(results) > max_display:
+        print(f"... and {len(results) - max_display} more materials\n")
+
+
+def main():
+    """Main entry point for the predictor CLI."""
+    parser = argparse.ArgumentParser(
+        description='Predict magnetic and energetic properties of materials',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Predict all properties using 90:10 split model
+  python predictor.py --features data/features.pkl --task all --split 90_10
+  
+  # Predict only magnetic ordering
+  python predictor.py --features data/features.csv --task ordering
+  
+  # Predict formation energy using 70:30 split model
+  python predictor.py --features data/features.pkl --task formation --split 70_30
+  
+  # Save output to file
+  python predictor.py --features data/features.pkl --output predictions.json
+  
+  # Verbose output with full probabilities
+  python predictor.py --features data/features.pkl --verbose
+
+Notes:
+  - Features must be 518-dimensional vectors computed by pipeline.py
+  - Models are trained on FM and FiM magnetic materials only
+  - 90:10 split typically provides better generalization
+  - 70:30 split may be more conservative (higher regularization)
+        """
+    )
+    
+    parser.add_argument('--features', required=True,
+                       help='Path to features file (.pkl or .csv)')
+    parser.add_argument('--task', choices=MaterialsPredictor.VALID_TASKS,
+                       default='all',
+                       help='Prediction task (default: all)')
+    parser.add_argument('--split', choices=MaterialsPredictor.VALID_SPLITS,
+                       default='90_10',
+                       help='Train/test split model to use (default: 90_10)')
+    parser.add_argument('--weights-dir', default='weights',
+                       help='Directory containing model weights (default: weights)')
+    parser.add_argument('--output', '-o',
+                       help='Output file for predictions (.json or .csv)')
+    parser.add_argument('--verbose', '-v', action='store_true',
+                       help='Verbose output with full probabilities')
+    parser.add_argument('--max-display', type=int, default=10,
+                       help='Maximum number of results to display (default: 10)')
+    
+    args = parser.parse_args()
+    
+    # Check if features file exists
+    if not os.path.exists(args.features):
+        logger.error(f"Features file '{args.features}' not found")
+        sys.exit(1)
+    
+    # Initialize predictor
+    print(f"\nInitializing Materials Predictor...")
+    print(f"Weights directory: {args.weights_dir}")
+    print(f"Model split: {args.split}")
+    print(f"Task: {args.task}\n")
+    
+    try:
+        predictor = MaterialsPredictor(weights_dir=args.weights_dir)
+    except ModelLoadError as e:
+        logger.error(str(e))
+        sys.exit(1)
+    
+    # Make predictions
+    logger.info(f"Making predictions from {args.features}...")
+    results = predictor.predict_from_features_file(
+        args.features,
+        task=args.task,
+        split=args.split
+    )
+    
+    if results is None:
+        logger.error("Failed to make predictions")
+        sys.exit(1)
+    
+    # Display results
+    display_results(results, verbose=args.verbose, max_display=args.max_display)
     
     # Save output if requested
     if args.output:
-        import json
-        
-        if args.output.endswith('.json'):
-            with open(args.output, 'w') as f:
-                json.dump(results, f, indent=2)
-            print(f"Results saved to {args.output}")
-        
-        elif args.output.endswith('.csv'):
-            # Flatten results for CSV
-            flat_results = []
-            for result in results:
-                flat = {'material_id': result['material_id']}
-                
-                if 'ordering' in result and result['ordering']:
-                    flat['ordering'] = result['ordering']['ordering']
-                    flat['ordering_confidence'] = result['ordering']['confidence']
-                
-                if 'moment' in result and result['moment']:
-                    flat['magnetic_moment'] = result['moment']['magnetic_moment']
-                
-                if 'formation' in result and result['formation']:
-                    flat['formation_energy'] = result['formation']['formation_energy']
-                
-                flat_results.append(flat)
-            
-            df = pd.DataFrame(flat_results)
-            df.to_csv(args.output, index=False)
-            print(f"Results saved to {args.output}")
-        
-        else:
-            print("Warning: Unsupported output format. Use .json or .csv")
+        save_results(results, args.output)
     
-    print("\nDone!")
+    print("\n✓ Done!")
 
 
 if __name__ == '__main__':
