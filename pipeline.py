@@ -213,15 +213,27 @@ def calculate_outer_products_from_composition(composition, element_df, cif_path=
             np.min(used_distances) if used_distances else 3.0,
             np.max(used_distances) if used_distances else 3.0
         ]
-        feature_vector.extend([dist_stats, [np.mean(en_differences), np.std(en_differences)],
-                              [np.mean(en_sq), np.std(en_sq)], [coordination_numbers.get(elem, 12.0) for elem in elements],
-                              lattice_params, [space_group]])
+        # Fix coordination numbers to a maximum of 4 elements
+        max_elements = 4
+        coord_list = [coordination_numbers.get(elem, 12.0) for elem in elements]
+        # Pad with 12.0 if fewer than max_elements, truncate if more
+        coord_list = (coord_list + [12.0] * max_elements)[:max_elements]
+        feature_vector.extend([
+            dist_stats,
+            [np.mean(en_differences), np.std(en_differences)],
+            [np.mean(en_sq), np.std(en_sq)],
+            coord_list,
+            lattice_params,
+            [space_group]
+        ])
     else:
-        feature_vector.extend([[np.mean(en_differences), np.std(en_differences)],
-                              [np.mean(en_sq), np.std(en_sq)], [12.0]])
+        feature_vector.extend([
+            [np.mean(en_differences), np.std(en_differences)],
+            [np.mean(en_sq), np.std(en_sq)],
+            [12.0]
+        ])
     feature_vector = np.concatenate(feature_vector)
     return feature_vector
-
 
 def extract_composition_from_cif(cif_path):
     try:
