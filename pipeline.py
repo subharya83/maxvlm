@@ -13,182 +13,81 @@ import re
 from pathlib import Path
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from tqdm import tqdm
+from pymatgen.core import Structure
+from pymatgen.analysis.local_env import CrystalNN
 
 
 # ============================================================================
-# DATA DOWNLOAD MODULE
+# UTILITY FUNCTION FOR GEOMETRY EXTRACTION
 # ============================================================================
 
-def download_cif_files(compound_df, cif_dir, api_key):
-    """Download CIF files from Materials Project"""
+def extract_geometry_from_cif(cif_path, max_distance=5.0):
+    """
+    Extract interatomic distances and coordination numbers from a CIF file.
+
+    Args:
+        cif_path (str): Path to the CIF file.
+        max_distance (float): Maximum distance (in Å) for neighbor detection.
+
+    Returns:
+        tuple: (distances, avg_coordination)
+            - distances (list): List of interatomic distances for all neighbor pairs.
+            - avg_coordination (float): Average coordination number across sites.
+    """
     try:
-        from pymatgen.ext.matproj import MPRester
-    except ImportError:
-        print("Error: pymatgen not installed. Install with: pip install pymatgen")
-        return False
+        # Load structure from CIF
+        structure = Structure.from_file(cif_path)
+        
+        # Use CrystalNN for neighbor analysis
+        cnn = CrystalNN(distance_cutoffs=None, x_diff_weight=0.0, porous_adjustment=False)
+        
+        distances = []
+        coordination_numbers = []
+        
+        # Iterate over all sites in the structure
+        for i, site in enumerate(structure):
+            # Get neighbors for the current site
+            neighbors = cnn.get_nn_info(structure, i)
+            
+            # Extract distances to neighbors within max_distance
+            for neighbor in neighbors:
+                dist = neighbor['site'].distance(site)
+                if dist <= max_distance:
+                    distances.append(dist)
+            
+            # Store coordination number (number of neighbors)
+            coordination_numbers.append(len(neighbors))
+        
+        # Calculate average coordination number
+        avg_coordination = np.mean(coordination_numbers) if coordination_numbers else 12.0
+        
+        # If no distances found, use a default
+        if not distances:
+            distances = [3.0]  # Fallback to default distance
+        
+        return distances, avg_coordination
     
-    os.makedirs(cif_dir, exist_ok=True)
-    material_ids = compound_df['material_id'].unique()
-    
-    # Check which files already exist
-    existing_cifs = set(f.stem for f in Path(cif_dir).glob("*.cif"))
-    materials_to_download = [mid for mid in material_ids if mid not in existing_cifs]
-    
-    if not materials_to_download:
-        print(f"All {len(material_ids)} CIF files already exist in {cif_dir}")
-        return True
-    
-    print(f"Found {len(existing_cifs)} existing CIF files")
-    print(f"Downloading {len(materials_to_download)} remaining CIF files...")
-    
-    failed = []
-    with MPRester(api_key) as m:
-        for material_id in tqdm(materials_to_download, desc="Downloading CIFs"):
-            try:
-                structure = m.get_structure_by_material_id(material_id)
-                cif_path = os.path.join(cif_dir, f"{material_id}.cif")
-                structure.to(filename=cif_path)
-            except Exception as e:
-                print(f"\nError downloading {material_id}: {e}")
-                failed.append(material_id)
-    
-    if failed:
-        print(f"\nFailed to download {len(failed)} materials: {failed[:5]}...")
-    
-    print(f"Download complete. Files saved to {cif_dir}")
-    return True
+    except Exception as e:
+        print(f"Error extracting geometry from {cif_path}: {e}")
+        return [3.0], 12.0  # Fallback to defaults
 
 
 # ============================================================================
-# FEATURE EXTRACTION MODULE
+# FEATURE EXTRACTION MODULE (MODIFIED)
 # ============================================================================
 
-def derive_unpaired_electrons(electron_config):
+def calculate_outer_products_from_composition(composition, element_df, cif_path=None, max_distance=5.0):
     """
-    Derive unpaired electrons from electron configuration
-    Uses Hund's rule - count electrons in outermost orbital shell
-    """
-    if pd.isna(electron_config) or electron_config == '':
-        return 0
-    
-    # Extract last subshell (e.g., "3d5" from "[Ar] 3d5 4s2")
-    orbitals = electron_config.split()
-    if not orbitals:
-        return 0
-    
-    last_orbital = orbitals[-1]
-    
-    # Parse orbital notation (e.g., "3d5" -> d orbital with 5 electrons)
-    import re
-    match = re.search(r'([spdf])(\d+)', last_orbital)
-    if not match:
-        return 0
-    
-    orbital_type = match.group(1)
-    num_electrons = int(match.group(2))
-    
-    # Max electrons per orbital type
-    max_electrons = {'s': 2, 'p': 6, 'd': 10, 'f': 14}
-    max_e = max_electrons.get(orbital_type, 0)
-    
-    # Calculate unpaired electrons using Hund's rule
-    if num_electrons <= max_e // 2:
-        return num_electrons
-    else:
-        return max_e - num_electrons
+    Calculate outer product features from composition string, using dynamic geometry from CIF.
 
-
-def derive_group_period(atomic_number):
-    """
-    Derive group and period from atomic number
-    Returns (group, period)
-    """
-    # Period boundaries
-    period_boundaries = [0, 2, 10, 18, 36, 54, 86, 118]
-    period = 1
-    for i, boundary in enumerate(period_boundaries[1:], 1):
-        if atomic_number <= boundary:
-            period = i
-            break
-    
-    # Group mapping (simplified for main group elements)
-    # This is approximate and may need refinement for transition metals
-    group_map = {
-        1: 1, 2: 2,  # s-block
-        3: 3, 4: 4, 5: 5, 6: 6, 7: 7, 8: 8, 9: 9, 10: 10,  # d-block approximation
-        13: 13, 14: 14, 15: 15, 16: 16, 17: 17, 18: 18  # p-block
-    }
-    
-    # Simplified group assignment
-    if atomic_number in [1]:
-        group = 1
-    elif atomic_number in [2]:
-        group = 18
-    elif atomic_number <= 2:
-        group = atomic_number
-    elif atomic_number <= 18:
-        # Period 2-3 elements
-        if atomic_number <= 10:
-            group = atomic_number - 2 if atomic_number > 2 else atomic_number
-        else:
-            group = atomic_number - 10 + 13 if atomic_number > 10 else 1
-    else:
-        # For heavier elements, use a lookup or default
-        group = ((atomic_number - 2) % 18) + 1 if atomic_number > 18 else 1
-    
-    return group, period
-
-
-def prepare_element_features(element_csv):
-    """Prepare element feature vectors from available columns"""
-    element_df = pd.read_csv(element_csv)
-    
-    # Derive missing columns
-    print("Deriving missing element properties...")
-    
-    # Derive Group and Period from AtomicNumber
-    element_df[['Group', 'Period']] = element_df['AtomicNumber'].apply(
-        lambda x: pd.Series(derive_group_period(x))
-    )
-    
-    # Derive Unpaired Electrons (UE) from ElectronConfiguration
-    element_df['UE'] = element_df['ElectronConfiguration'].apply(derive_unpaired_electrons)
-    
-    # Handle missing values - fill with median
-    numeric_cols = ['Density', 'Electronegativity', 'IonizationEnergy', 'AtomicRadius']
-    for col in numeric_cols:
-        if element_df[col].isna().any():
-            missing_count = element_df[col].isna().sum()
-            median_val = element_df[col].median()
-            element_df.loc[:, col] = element_df[col].fillna(median_val)
-            print(f"  Filled {missing_count} missing {col} values with median")
-    
-    # Select features for model
-    features = element_df[['AtomicNumber', 'Group', 'Period', 'Density',
-                           'Electronegativity', 'UE', 'IonizationEnergy', 'AtomicRadius']]
-    
-    # Scale features
-    scaled_features = StandardScaler().fit_transform(features)
-    squared_features = np.square(scaled_features)
-    extended_features = np.hstack((scaled_features, squared_features))
-    
-    element_df['vector'] = list(extended_features)
-    element_df = element_df.filter(items=['Symbol', 'vector'])
-    element_df.rename(columns={'Symbol': 'Element', 'vector': 'Vector'}, inplace=True)
-    
-    return element_df
-
-
-def calculate_outer_products_from_composition(composition, element_df, 
-                                              distance=3.0, num_neighbors=12):
-    """
-    Calculate outer product features from composition string
-    
     Args:
         composition: str (e.g., "Fe2O3") or dict (e.g., {"Fe": 2, "O": 3})
         element_df: DataFrame with element vectors
-        distance: float, assumed average distance between atoms
-        num_neighbors: int, assumed number of neighbors
+        cif_path: str, path to CIF file for geometry extraction (optional)
+        max_distance: float, maximum distance for neighbor detection (in Å)
+
+    Returns:
+        np.ndarray: Feature vector including outer products and geometry statistics
     """
     # Parse composition
     if isinstance(composition, str):
@@ -207,9 +106,19 @@ def calculate_outer_products_from_composition(composition, element_df,
             raise ValueError(f"Element {elem} not found in element database")
         vectors[elem] = vec_row['Vector'].values[0]
     
-    # Calculate outer products with simplified geometry
+    # Extract dynamic geometry from CIF if provided
+    if cif_path and os.path.exists(cif_path):
+        distances, avg_coordination = extract_geometry_from_cif(cif_path, max_distance)
+    else:
+        # Fallback to default values if no CIF or CIF processing fails
+        distances = [3.0]
+        avg_coordination = 12.0
+        if cif_path:
+            print(f"Warning: CIF file {cif_path} not found, using default distance=3.0 Å and neighbors={avg_coordination}")
+
+    # Calculate outer products with dynamic geometry
     outer_product_matrices = []
-    distances = []
+    used_distances = []
     en_differences = []
     en_sq = []
     
@@ -225,12 +134,13 @@ def calculate_outer_products_from_composition(composition, element_df,
                 vec_i = vectors[elem_i]
                 vec_j = vectors[elem_j]
                 
-                dist = distance
+                # Use average distance from CIF or cycle through distances
+                dist = distances[(i + j) % len(distances)]  # Distribute distances across pairs
                 outer_product = np.outer(vec_i, vec_j) / (dist * dist)
                 outer_product_matrices.append(outer_product)
-                distances.append(dist)
+                used_distances.append(dist)
                 
-                en_i = vec_i[4]
+                en_i = vec_i[4]  # Electronegativity index
                 en_j = vec_j[4]
                 en_diff1 = abs(en_i - en_j)
                 en_diff2 = abs(en_i * en_i - en_j * en_j)
@@ -242,9 +152,10 @@ def calculate_outer_products_from_composition(composition, element_df,
         # Single element - use self interaction
         elem = element_list[0]
         vec = vectors[elem]
-        outer_product = np.outer(vec, vec) / (distance * distance)
+        dist = distances[0]  # Use first available distance
+        outer_product = np.outer(vec, vec) / (dist * dist)
         outer_product_matrices = [outer_product]
-        distances = [distance]
+        used_distances = [dist]
         en_differences = [0.0]
         en_sq = [0.0]
     
@@ -254,67 +165,29 @@ def calculate_outer_products_from_composition(composition, element_df,
     mean_matrix = np.mean(outer_product_matrices, axis=0)
     std_matrix = np.std(outer_product_matrices, axis=0)
     
-    dist_mean = np.mean(distances)
-    dist_std = np.std(distances)
+    dist_mean = np.mean(used_distances)
+    dist_std = np.std(used_distances)
     
     en_diff_mean = np.mean(en_differences)
     en_diff_std = np.std(en_differences)
     en_sq_mean = np.mean(en_sq)
     en_sq_std = np.std(en_sq)
     
-    # Flatten and concatenate
-    flattened_mean = mean_matrix.flatten()
-    flattened_std = std_matrix.flatten()
-    
+    # Add coordination number as a feature
     feature_vector = np.concatenate([
-        flattened_mean, flattened_std,
+        mean_matrix.flatten(),
+        std_matrix.flatten(),
         [dist_mean, dist_std],
         [en_diff_mean, en_diff_std],
-        [en_sq_mean, en_sq_std]
+        [en_sq_mean, en_sq_std],
+        [avg_coordination]  # New feature: average coordination number
     ])
     
     return feature_vector
 
 
-def extract_composition_from_cif(cif_path):
-    """Extract chemical composition from CIF file"""
-    try:
-        from pymatgen.core import Structure
-        structure = Structure.from_file(cif_path)
-        return structure.composition.reduced_formula
-    except Exception as e:
-        return None
-
-
-def extract_compositions_from_cifs(material_ids, cif_dir):
-    """Extract compositions from CIF files for given material IDs"""
-    compositions = {}
-    missing = []
-    
-    print(f"\nExtracting compositions from CIF files in {cif_dir}...")
-    
-    for material_id in tqdm(material_ids, desc="Reading CIFs"):
-        cif_path = Path(cif_dir) / f"{material_id}.cif"
-        if cif_path.exists():
-            comp = extract_composition_from_cif(cif_path)
-            if comp:
-                compositions[material_id] = comp
-            else:
-                missing.append(material_id)
-        else:
-            missing.append(material_id)
-    
-    if missing:
-        print(f"Warning: Could not extract composition for {len(missing)} materials")
-        if len(missing) <= 10:
-            print(f"Missing: {missing}")
-    
-    print(f"Extracted {len(compositions)} compositions from CIF files")
-    return compositions
-
-
-def compute_features(input_csv, element_df, distance=3.0, neighbors=12):
-    """Compute features from compositions in CSV file"""
+def compute_features(input_csv, element_df, cif_dir='cifs', max_distance=5.0):
+    """Compute features from compositions in CSV file, using CIF files for geometry."""
     df = pd.read_csv(input_csv)
     
     if 'material_id' not in df.columns:
@@ -338,11 +211,14 @@ def compute_features(input_csv, element_df, distance=3.0, neighbors=12):
         material_id = row['material_id']
         composition = row['composition']
         
+        # Construct CIF path
+        cif_path = os.path.join(cif_dir, f"{material_id}.cif")
+        
         try:
             features = calculate_outer_products_from_composition(
                 composition, element_df,
-                distance=distance,
-                num_neighbors=neighbors
+                cif_path=cif_path,
+                max_distance=max_distance
             )
             
             results.append({
@@ -365,72 +241,7 @@ def compute_features(input_csv, element_df, distance=3.0, neighbors=12):
 
 
 # ============================================================================
-# TRAINING DATA PREPARATION MODULE
-# ============================================================================
-
-def prepare_training_data(compound_file, features_df):
-    """
-    Prepare training data by merging compound properties with features
-    
-    Args:
-        compound_file: Path to compound properties CSV file
-        features_df: DataFrame with computed features
-    """
-    print("Loading compound data...")
-    compound_df = pd.read_csv(compound_file)
-    print(f"Loaded {len(compound_df)} compounds")
-    
-    # Filter to FM and FiM only
-    categories_to_keep = ['FM', 'FiM']
-    compound_df = compound_df[compound_df['ordering'].isin(categories_to_keep)]
-    print(f"Filtered to {len(compound_df)} FM/FiM compounds")
-    
-    # Encode ordering labels
-    encoder = LabelEncoder()
-    compound_df['ordering'] = encoder.fit_transform(compound_df['ordering'])
-    print(f"Class mappings: {dict(zip(encoder.classes_, range(len(encoder.classes_))))}")
-    
-    # Merge features with compound properties
-    print("\nMerging data...")
-    result = features_df.copy()
-    result = result.rename(columns={'features': 'outer_product'})
-    
-    # Add ordering
-    ordering_map = dict(zip(
-        compound_df['material_id'],
-        compound_df['ordering']
-    ))
-    result['ordering'] = result['material_id'].map(ordering_map)
-    
-    # Add moment
-    if 'total_magnetization_normalized_atoms' in compound_df.columns:
-        moment_map = dict(zip(
-            compound_df['material_id'],
-            compound_df['total_magnetization_normalized_atoms']
-        ))
-        result['total_magnetization_normalized_atoms'] = result['material_id'].map(moment_map)
-    
-    # Add formation energy
-    if 'formation_energy_per_atom' in compound_df.columns:
-        formation_map = dict(zip(
-            compound_df['material_id'],
-            compound_df['formation_energy_per_atom']
-        ))
-        result['formation_energy_per_atom'] = result['material_id'].map(formation_map)
-    
-    print(f"\nFinal dataset statistics:")
-    print(f"  Total materials: {len(result)}")
-    print(f"  With ordering labels: {result['ordering'].notna().sum()}")
-    if 'total_magnetization_normalized_atoms' in result.columns:
-        print(f"  With moment values: {result['total_magnetization_normalized_atoms'].notna().sum()}")
-    if 'formation_energy_per_atom' in result.columns:
-        print(f"  With formation energy: {result['formation_energy_per_atom'].notna().sum()}")
-    
-    return result
-
-
-# ============================================================================
-# MAIN PIPELINE
+# MAIN PIPELINE (MODIFIED)
 # ============================================================================
 
 def main():
@@ -439,13 +250,10 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Full pipeline: download CIFs, compute features, prepare training data
-  python pipeline.py -c compounds.xlsx -e elements.csv -o training.pkl -k YOUR_API_KEY
-  
-  # Skip download (CIFs already exist)
+  # Full pipeline: compute features, prepare training data (assumes CIFs pre-downloaded)
   python pipeline.py -c compounds.xlsx -e elements.csv -o training.pkl --skip-download
   
-  # Only compute features (no download, no training data prep)
+  # Only compute features
   python pipeline.py -i compositions.csv -e elements.csv -f features.pkl --features-only
         """
     )
@@ -465,20 +273,16 @@ Examples:
                        help='Output pickle file for features only')
     
     # API and directories
-    parser.add_argument('-k', '--api-key',
-                       help='Materials Project API key')
     parser.add_argument('-d', '--cif-dir', default='cifs',
-                       help='Directory for CIF files (default: cifs)')
+                       help='Directory for pre-downloaded CIF files (default: cifs)')
     
     # Pipeline control
     parser.add_argument('--skip-download', action='store_true',
-                       help='Skip CIF download step')
+                       help='Skip CIF download step (assumes CIFs are pre-downloaded)')
     parser.add_argument('--features-only', action='store_true',
                        help='Only compute features, no training data prep')
-    parser.add_argument('--distance', type=float, default=3.0,
-                       help='Assumed atomic distance in Å (default: 3.0)')
-    parser.add_argument('--neighbors', type=int, default=12,
-                       help='Assumed number of neighbors (default: 12)')
+    parser.add_argument('--max-distance', type=float, default=5.0,
+                       help='Maximum distance for neighbor detection in Å (default: 5.0)')
     
     args = parser.parse_args()
     
@@ -499,6 +303,11 @@ Examples:
         print(f"Error: Element file not found: {args.elements}")
         return 1
     
+    # Check CIF directory exists
+    if not Path(args.cif_dir).exists():
+        print(f"Error: CIF directory '{args.cif_dir}' not found")
+        return 1
+    
     print("="*80)
     print("MATERIALS DATA PIPELINE")
     print("="*80)
@@ -508,18 +317,9 @@ Examples:
     element_df = prepare_element_features(args.elements)
     print(f"Loaded {len(element_df)} elements")
     
-    # Step 1: Download CIFs (if needed)
-    if not args.skip_download and not args.features_only:
-        if not args.api_key:
-            print("\nWarning: No API key provided. Skipping CIF download.")
-            print("Use -k/--api-key to enable download, or --skip-download to suppress this warning.")
-        else:
-            print("\n" + "="*80)
-            print("STEP 1: DOWNLOADING CIF FILES")
-            print("="*80)
-            
-            compound_df = pd.read_excel(args.compounds)
-            download_cif_files(compound_df, args.cif_dir, args.api_key)
+    # Step 1: Skip CIF download (assumed pre-downloaded)
+    if not args.skip_download:
+        print("\nWarning: --skip-download not specified, but CIF download is skipped as per assumption.")
     
     # Step 2: Compute features
     print("\n" + "="*80)
@@ -530,8 +330,8 @@ Examples:
         # Use provided composition file
         features_df = compute_features(
             args.input, element_df,
-            distance=args.distance,
-            neighbors=args.neighbors
+            cif_dir=args.cif_dir,
+            max_distance=args.max_distance
         )
     elif args.compounds:
         # Extract compositions from compounds file
@@ -548,16 +348,8 @@ Examples:
                 break
         
         if composition_col is None:
-            # Try to extract from CIF files if they exist
-            print("\nNo composition column found. Attempting to extract from CIF files...")
-            
-            if not Path(args.cif_dir).exists():
-                print(f"\nError: CIF directory '{args.cif_dir}' not found")
-                print("\nTo proceed, you can either:")
-                print("  1. Download CIF files first (remove --skip-download and provide -k API_KEY)")
-                print("  2. Add a 'composition' column to your compounds Excel file")
-                print("  3. Create a separate CSV with 'material_id,composition' and use -i flag")
-                return 1
+            # Try to extract from CIF files
+            print("\nNo composition column found. Extracting from CIF files...")
             
             try:
                 compositions_dict = extract_compositions_from_cifs(
@@ -588,8 +380,8 @@ Examples:
         
         features_df = compute_features(
             temp_csv, element_df,
-            distance=args.distance,
-            neighbors=args.neighbors
+            cif_dir=args.cif_dir,
+            max_distance=args.max_distance
         )
         
         temp_csv.unlink()  # Clean up
