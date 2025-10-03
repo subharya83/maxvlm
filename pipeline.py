@@ -63,13 +63,110 @@ def download_cif_files(compound_df, cif_dir, api_key):
 # FEATURE EXTRACTION MODULE
 # ============================================================================
 
+def derive_unpaired_electrons(electron_config):
+    """
+    Derive unpaired electrons from electron configuration
+    Uses Hund's rule - count electrons in outermost orbital shell
+    """
+    if pd.isna(electron_config) or electron_config == '':
+        return 0
+    
+    # Extract last subshell (e.g., "3d5" from "[Ar] 3d5 4s2")
+    orbitals = electron_config.split()
+    if not orbitals:
+        return 0
+    
+    last_orbital = orbitals[-1]
+    
+    # Parse orbital notation (e.g., "3d5" -> d orbital with 5 electrons)
+    import re
+    match = re.search(r'([spdf])(\d+)', last_orbital)
+    if not match:
+        return 0
+    
+    orbital_type = match.group(1)
+    num_electrons = int(match.group(2))
+    
+    # Max electrons per orbital type
+    max_electrons = {'s': 2, 'p': 6, 'd': 10, 'f': 14}
+    max_e = max_electrons.get(orbital_type, 0)
+    
+    # Calculate unpaired electrons using Hund's rule
+    if num_electrons <= max_e // 2:
+        return num_electrons
+    else:
+        return max_e - num_electrons
+
+
+def derive_group_period(atomic_number):
+    """
+    Derive group and period from atomic number
+    Returns (group, period)
+    """
+    # Period boundaries
+    period_boundaries = [0, 2, 10, 18, 36, 54, 86, 118]
+    period = 1
+    for i, boundary in enumerate(period_boundaries[1:], 1):
+        if atomic_number <= boundary:
+            period = i
+            break
+    
+    # Group mapping (simplified for main group elements)
+    # This is approximate and may need refinement for transition metals
+    group_map = {
+        1: 1, 2: 2,  # s-block
+        3: 3, 4: 4, 5: 5, 6: 6, 7: 7, 8: 8, 9: 9, 10: 10,  # d-block approximation
+        13: 13, 14: 14, 15: 15, 16: 16, 17: 17, 18: 18  # p-block
+    }
+    
+    # Simplified group assignment
+    if atomic_number in [1]:
+        group = 1
+    elif atomic_number in [2]:
+        group = 18
+    elif atomic_number <= 2:
+        group = atomic_number
+    elif atomic_number <= 18:
+        # Period 2-3 elements
+        if atomic_number <= 10:
+            group = atomic_number - 2 if atomic_number > 2 else atomic_number
+        else:
+            group = atomic_number - 10 + 13 if atomic_number > 10 else 1
+    else:
+        # For heavier elements, use a lookup or default
+        group = ((atomic_number - 2) % 18) + 1 if atomic_number > 18 else 1
+    
+    return group, period
+
+
 def prepare_element_features(element_csv):
-    """Prepare element feature vectors"""
+    """Prepare element feature vectors from available columns"""
     element_df = pd.read_csv(element_csv)
     
+    # Derive missing columns
+    print("Deriving missing element properties...")
+    
+    # Derive Group and Period from AtomicNumber
+    element_df[['Group', 'Period']] = element_df['AtomicNumber'].apply(
+        lambda x: pd.Series(derive_group_period(x))
+    )
+    
+    # Derive Unpaired Electrons (UE) from ElectronConfiguration
+    element_df['UE'] = element_df['ElectronConfiguration'].apply(derive_unpaired_electrons)
+    
+    # Handle missing values - fill with median
+    numeric_cols = ['Density', 'Electronegativity', 'IonizationEnergy', 'AtomicRadius']
+    for col in numeric_cols:
+        if element_df[col].isna().any():
+            median_val = element_df[col].median()
+            element_df[col].fillna(median_val, inplace=True)
+            print(f"  Filled {element_df[col].isna().sum()} missing {col} values with median")
+    
+    # Select features for model
     features = element_df[['AtomicNumber', 'Group', 'Period', 'Density',
                            'Electronegativity', 'UE', 'IonizationEnergy', 'AtomicRadius']]
     
+    # Scale features
     scaled_features = StandardScaler().fit_transform(features)
     squared_features = np.square(scaled_features)
     extended_features = np.hstack((scaled_features, squared_features))
