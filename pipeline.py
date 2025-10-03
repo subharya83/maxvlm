@@ -373,11 +373,11 @@ def prepare_training_data(compound_file, features_df):
     Prepare training data by merging compound properties with features
     
     Args:
-        compound_file: Path to compound properties Excel file
+        compound_file: Path to compound properties CSV file
         features_df: DataFrame with computed features
     """
     print("Loading compound data...")
-    compound_df = pd.read_excel(compound_file)
+    compound_df = pd.read_csv(compound_file)
     print(f"Loaded {len(compound_df)} compounds")
     
     # Filter to FM and FiM only
@@ -452,7 +452,7 @@ Examples:
     
     # Input files
     parser.add_argument('-c', '--compounds',
-                       help='Compound properties Excel file')
+                       help='Compound properties CSV file')
     parser.add_argument('-e', '--elements', required=True,
                        help='Element properties CSV file')
     parser.add_argument('-i', '--input',
