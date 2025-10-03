@@ -158,9 +158,10 @@ def prepare_element_features(element_csv):
     numeric_cols = ['Density', 'Electronegativity', 'IonizationEnergy', 'AtomicRadius']
     for col in numeric_cols:
         if element_df[col].isna().any():
+            missing_count = element_df[col].isna().sum()
             median_val = element_df[col].median()
-            element_df[col].fillna(median_val, inplace=True)
-            print(f"  Filled {element_df[col].isna().sum()} missing {col} values with median")
+            element_df.loc[:, col] = element_df[col].fillna(median_val)
+            print(f"  Filled {missing_count} missing {col} values with median")
     
     # Select features for model
     features = element_df[['AtomicNumber', 'Group', 'Period', 'Density',
@@ -275,12 +276,58 @@ def calculate_outer_products_from_composition(composition, element_df,
     return feature_vector
 
 
+def extract_composition_from_cif(cif_path):
+    """Extract chemical composition from CIF file"""
+    try:
+        from pymatgen.core import Structure
+        structure = Structure.from_file(cif_path)
+        return structure.composition.reduced_formula
+    except Exception as e:
+        return None
+
+
+def extract_compositions_from_cifs(material_ids, cif_dir):
+    """Extract compositions from CIF files for given material IDs"""
+    compositions = {}
+    missing = []
+    
+    print(f"\nExtracting compositions from CIF files in {cif_dir}...")
+    
+    for material_id in tqdm(material_ids, desc="Reading CIFs"):
+        cif_path = Path(cif_dir) / f"{material_id}.cif"
+        if cif_path.exists():
+            comp = extract_composition_from_cif(cif_path)
+            if comp:
+                compositions[material_id] = comp
+            else:
+                missing.append(material_id)
+        else:
+            missing.append(material_id)
+    
+    if missing:
+        print(f"Warning: Could not extract composition for {len(missing)} materials")
+        if len(missing) <= 10:
+            print(f"Missing: {missing}")
+    
+    print(f"Extracted {len(compositions)} compositions from CIF files")
+    return compositions
+
+
 def compute_features(input_csv, element_df, distance=3.0, neighbors=12):
     """Compute features from compositions in CSV file"""
     df = pd.read_csv(input_csv)
     
-    if 'material_id' not in df.columns or 'composition' not in df.columns:
-        raise ValueError("Input CSV must have 'material_id' and 'composition' columns")
+    if 'material_id' not in df.columns:
+        raise ValueError("Input CSV must have 'material_id' column")
+    
+    if 'composition' not in df.columns:
+        raise ValueError("Input CSV must have 'composition' column")
+    
+    # Filter out rows with missing compositions
+    initial_count = len(df)
+    df = df.dropna(subset=['composition'])
+    if len(df) < initial_count:
+        print(f"Warning: Dropped {initial_count - len(df)} materials with missing compositions")
     
     print(f"Computing features for {len(df)} materials...")
     
@@ -310,6 +357,8 @@ def compute_features(input_csv, element_df, distance=3.0, neighbors=12):
         print(f"\nFailed to compute features for {len(failed)} materials")
         for mid, err in failed[:5]:
             print(f"  {mid}: {err}")
+        if len(failed) > 5:
+            print(f"  ... and {len(failed) - 5} more")
     
     print(f"Successfully computed features for {len(results)} materials")
     return pd.DataFrame(results)
@@ -488,20 +537,54 @@ Examples:
         # Extract compositions from compounds file
         compound_df = pd.read_excel(args.compounds)
         
-        # Check if composition column exists
-        if 'composition' not in compound_df.columns:
-            # Try to use formula or other columns
-            if 'formula' in compound_df.columns:
-                compound_df['composition'] = compound_df['formula']
-            elif 'pretty_formula' in compound_df.columns:
-                compound_df['composition'] = compound_df['pretty_formula']
-            else:
-                print("Error: No composition/formula column found in compounds file")
+        # Check available columns
+        print(f"Available columns in compounds file: {list(compound_df.columns)}")
+        
+        # Try to find a composition/formula column
+        composition_col = None
+        for col_name in ['composition', 'formula', 'pretty_formula', 'reduced_cell_formula']:
+            if col_name in compound_df.columns:
+                composition_col = col_name
+                break
+        
+        if composition_col is None:
+            # Try to extract from CIF files if they exist
+            print("\nNo composition column found. Attempting to extract from CIF files...")
+            
+            if not Path(args.cif_dir).exists():
+                print(f"\nError: CIF directory '{args.cif_dir}' not found")
+                print("\nTo proceed, you can either:")
+                print("  1. Download CIF files first (remove --skip-download and provide -k API_KEY)")
+                print("  2. Add a 'composition' column to your compounds Excel file")
+                print("  3. Create a separate CSV with 'material_id,composition' and use -i flag")
                 return 1
+            
+            try:
+                compositions_dict = extract_compositions_from_cifs(
+                    compound_df['material_id'].values,
+                    args.cif_dir
+                )
+                
+                if not compositions_dict:
+                    print("\nError: No compositions could be extracted from CIF files")
+                    return 1
+                
+                # Add compositions to dataframe
+                compound_df['composition'] = compound_df['material_id'].map(compositions_dict)
+                composition_col = 'composition'
+                
+            except ImportError:
+                print("\nError: pymatgen not installed. Install with: pip install pymatgen")
+                print("Or add a 'composition' column to your compounds file manually")
+                return 1
+        
+        print(f"Using '{composition_col}' column for compositions")
         
         # Save temporary CSV
         temp_csv = Path('temp_compositions.csv')
-        compound_df[['material_id', 'composition']].to_csv(temp_csv, index=False)
+        temp_df = compound_df[['material_id', composition_col]].copy()
+        temp_df.rename(columns={composition_col: 'composition'}, inplace=True)
+        temp_df.to_csv(temp_csv, index=False)
         
         features_df = compute_features(
             temp_csv, element_df,
