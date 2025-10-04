@@ -1,210 +1,215 @@
 # Materials Property Prediction CLI
 
-A command-line tool for predicting magnetic and energetic properties of materials using machine learning.
+A command-line tool for predicting magnetic and energetic properties of 
+materials using LightGBM models.
 
 ## Features
 
-- **Magnetic Ordering Classification**: Predict FM (Ferromagnetic) vs FiM (Ferrimagnetic)
-- **Magnetic Moment Regression**: Predict total magnetization per atom (μB/atom)
-- **Formation Energy Regression**: Predict formation energy per atom (eV/atom)
-- No API keys required - works with pre-computed features
-- Multiple train/test split models (90:10 and 70:30)
+- **Magnetic Ordering**: Classify FM (Ferromagnetic) vs FiM (Ferrimagnetic)
+- **Magnetic Moment**: Predict magnetization per atom (μB/atom)
+- **Formation Energy**: Predict formation energy per atom (eV/atom)
+- Supports default (518 features) and extended (1369 features) modes
+- Train/test splits: 90:10 and 70:30
 
 ## Installation
 
-### Requirements
-
 ```bash
-pip install -r requirements.txt
+pip install pandas numpy scikit-learn lightgbm scipy pymatgen matplotlib
 ```
 
-Required packages:
-- pandas
-- numpy
-- scikit-learn
-- lightgbm
-- scipy
-
-### Directory Structure
+## Directory Structure
 
 ```
 .
-├── predict_materials.py      # Main prediction script
-├── train_models.py           # Model training script
-├── compute_features.py       # Feature engineering script
-├── requirements.txt          # Python dependencies
-├── README.md                 # This file
-├── data/                     # Data directory
-│   ├── Elemental_property_data.csv
-│   ├── Compound_property_data.xlsx (for training)
-│   └── features.pkl (computed features)
-└── weights/                  # Model weights directory
-    ├── element_features.pkl
-    ├── magnetic_ordering_model_90_10.pkl
-    ├── magnetic_ordering_model_70_30.pkl
-    ├── magnetic_moment_model_90_10.pkl
-    ├── magnetic_moment_model_70_30.pkl
-    ├── formation_energy_model_90_10.pkl
-    └── formation_energy_model_70_30.pkl
+├── pipeline.py              # Feature engineering
+├── trainer.py               # Model training
+├── predictor.py             # Prediction
+├── README.md                # This file
+├── data/                    # Data directory
+│   ├── Compound_property_data.csv
+│   ├── PubChemElements_all.csv
+│   └── cifs/                # CIF files (optional)
+├── output/                  # Feature output
+│   ├── features.pkl         # Default features (518)
+│   └── training_data_x.pkl  # Extended features (1369)
+├── weights/                 # Default model weights
+└── weights_x/               # Extended model weights
 ```
 
 ## Usage
 
-### 1. Prepare Data Files
+### 1. Compute Features
 
-You need two data files:
-- `Elemental_property_data.csv` - Element properties (Symbol, Atomic number, Group, Period, Density, Electronegativity, Ionisation Energy, Atomic radius, UE)
-- Pre-computed features file (`.pkl` format) OR composition data to compute features
-
-### 2. Compute Features (Optional)
-
-If you have material compositions but not pre-computed features:
+Generate features from compositions:
 
 ```bash
-# From a CSV file with compositions
-python compute_features.py \
-    --input data/compositions.csv \
-    --elements data/Elemental_property_data.csv \
-    --output data/features.pkl
+# From CSV
+python pipeline.py -c data/Compound_property_data.csv -e data/PubChemElements_all.csv -o output/training_data.pkl -f output/features.pkl -d data/cifs
 
-# For a single composition
-python compute_features.py \
-    --composition "Fe2O3" \
-    --elements data/Elemental_property_data.csv \
-    --output data/Fe2O3_features.pkl
+# Extended mode (-x)
+python pipeline.py -c data/Compound_property_data.csv -e data/PubChemElements_all.csv -o output/training_data_x.pkl -f output/features_x.pkl -d data/cifs -x
+
+# Single composition
+python pipeline.py -c "Fe2O3" -e data/PubChemElements_all.csv -o output/Fe2O3_features.pkl
 ```
 
-**CSV format for compositions:**
+**Input CSV Format**:
 ```csv
 material_id,composition
 mat_001,Fe2O3
 mat_002,NiFe2O4
-mat_003,CoFe2O4
 ```
 
-### 3. Train Models
+### 2. Train Models
 
-If you have training data with known properties:
+Train models on pre-computed features:
 
 ```bash
-# Train all models
-python train_models.py \
-    --features data/training_features.pkl \
-    --elements data/Elemental_property_data.csv \
-    --weights-dir weights
+# Default (518 features)
+python trainer.py -f output/training_data.pkl -e data/PubChemElements_all.csv -w weights -t all
 
-# Train specific tasks
-python train_models.py \
-    --features data/training_features.pkl \
-    --elements data/Elemental_property_data.csv \
-    --tasks ordering moment \
-    --weights-dir weights
+# Extended (1369 features)
+python trainer.py -f output/training_data_x.pkl -e data/PubChemElements_all.csv -w weights_x -t all -x
 ```
 
-**Training data format** (pickle file with DataFrame):
-```python
-# DataFrame with columns:
-# - material_id: str
-# - outer_product: list/array (518-dimensional feature vector)
-# - ordering: int (0=FM, 1=FiM) [for classification]
-# - total_magnetization_normalized_atoms: float [for moment prediction]
-# - formation_energy_per_atom: float [for formation energy prediction]
-```
+### 3. Make Predictions
 
-### 4. Make Predictions
-
-Once models are trained:
+Predict using trained models:
 
 ```bash
-# Predict all properties
-python predict_materials.py \
-    --features data/features.pkl \
-    --task all \
-    --split 90_10
+# Default (518 features)
+python predictor.py -f output/features.pkl -t all -s 90_10 -w weights
 
-# Predict specific property
-python predict_materials.py \
-    --features data/features.pkl \
-    --task ordering \
-    --split 90_10
+# Extended (1369 features)
+python predictor.py -f output/training_data_x.pkl -t all -s 90_10 -w weights_x -x
 
-# Save predictions to file
-python predict_materials.py \
-    --features data/features.pkl \
-    --task all \
-    --output predictions.json
+# Save output
+python predictor.py -f output/training_data_x.pkl -t all -s 90_10 -w weights_x -x -o predictions.json
 
-# Use 70:30 split model
-python predict_materials.py \
-    --features data/features.pkl \
-    --split 70_30 \
-    --output predictions.csv
+# Verbose output
+python predictor.py -f output/features.pkl -t ordering -w weights -v
 ```
 
 ## Command-Line Options
 
-### predict_materials.py
-
+### pipeline.py
 ```
-usage: predict_materials.py [-h] --features FEATURES
-                           [--task {all,ordering,moment,formation}]
-                           [--split {90_10,70_30}]
-                           [--weights-dir WEIGHTS_DIR]
-                           [--output OUTPUT] [--verbose]
+usage: pipeline.py [-h] [-c INPUT | -c COMPOSITION] -e ELEMENTS [-o OUTPUT] [-f FEATURES] [-d CIF_DIR] [-x]
 
 Options:
-  --features FEATURES   Path to features file (.pkl or .csv)
-  --task TASK          Prediction task: all, ordering, moment, formation
-  --split SPLIT        Model split: 90_10 or 70_30 (default: 90_10)
-  --weights-dir DIR    Directory containing model weights
-  --output, -o FILE    Output file (.json or .csv)
-  --verbose, -v        Verbose output
+  -c FILE|COMPOSITION  Input CSV or single composition (e.g., "Fe2O3")
+  -e FILE              Element properties CSV
+  -o FILE              Output pickle file (training data)
+  -f FILE              Output pickle file (features)
+  -d DIR               Directory with CIF files
+  -x                   Extended mode (1369 features)
 ```
 
-### train_models.py
-
+### trainer.py
 ```
-usage: train_models.py [-h] --features FEATURES --elements ELEMENTS
-                      [--weights-dir WEIGHTS_DIR]
-                      [--tasks {ordering,moment,formation,all} [...]]
+usage: trainer.py [-h] -f FEATURES -e ELEMENTS [-w WEIGHTS_DIR] [-t {ordering,moment,formation,all}] [-n N_FEATURES] [-x]
 
 Options:
-  --features FEATURES   Path to training features pickle file
-  --elements ELEMENTS   Path to element properties CSV
-  --weights-dir DIR     Directory to save models (default: weights)
-  --tasks TASKS         Tasks to train (default: all)
+  -f FILE              Training features pickle file
+  -e FILE              Element properties CSV
+  -w DIR               Directory to save models (default: weights)
+  -t TASK              Tasks to train: ordering, moment, formation, all (default: all)
+  -n INT               Number of features to select (default: 100)
+  -x                   Extended mode (1369 features)
 ```
 
-### compute_features.py
-
+### predictor.py
 ```
-usage: compute_features.py [-h] [--input INPUT] [--composition COMPOSITION]
-                           --elements ELEMENTS [--output OUTPUT]
-                           [--distance DISTANCE] [--neighbors NEIGHBORS]
+usage: predictor.py [-h] -f FEATURES [-t {all,ordering,moment,formation}] [-s {90_10,70_30}] [-w WEIGHTS_DIR] [-x] [-o OUTPUT] [-v] [-m MAX_DISPLAY]
 
 Options:
-  --input, -i FILE      Input CSV with material_id and composition
-  --composition, -c     Single composition (e.g., "Fe2O3")
-  --elements ELEMENTS   Path to element properties CSV
-  --output, -o FILE     Output pickle file
-  --distance DISTANCE   Assumed atomic distance in Å (default: 3.0)
-  --neighbors NEIGHBORS Assumed coordination number (default: 12)
+  -f FILE              Features file (.pkl or .csv)
+  -t TASK              Prediction task: all, ordering, moment, formation (default: all)
+  -s SPLIT             Model split: 90_10, 70_30 (default: 90_10)
+  -w DIR               Directory with model weights (default: weights)
+  -x                   Extended mode (1369 features)
+  -o FILE              Output file (.json or .csv)
+  -v                   Verbose output
+  -m INT               Max results to display (default: 10)
 ```
 
-## Model Performance
+## Model Performance (90:10 Split)
 
-### Magnetic Ordering (90:10 split)
-- Training Accuracy: ~85%
-- Test Accuracy: ~84%
-- Test AUC-ROC: ~0.88
+- **Magnetic Ordering**:
+  - Test Accuracy: ~84%
+  - Test AUC-ROC: ~0.88
+- **Magnetic Moment**:
+  - Test RMSE: ~0.28 μB/atom
+  - Test R²: ~0.87
+- **Formation Energy**:
+  - Test RMSE: ~0.20 eV/atom
+  - Test R²: ~0.96
 
-### Magnetic Moment (90:10 split)
-- Test RMSE: ~0.28 μB/atom
-- Test R²: ~0.87
-- Test Correlation: ~0.93
+---
 
-### Formation Energy (90:10 split)
-- Test RMSE: ~0.20 eV/atom
-- Test R²: ~0.96
-- Test Correlation: ~0.98
+### **Changes Made**
 
+1. **Shortened Content**:
+   - Removed redundant details (e.g., detailed data formats, installation steps like `requirements.txt`).
+   - Simplified directory structure to focus on key files.
+   - Condensed usage examples and command-line options.
+
+2. **Short-Form Switches**:
+   - Updated all commands to use `-f`, `-e`, `-c`, `-o`, `-d`, `-t`, `-s`, `-w`, `-x`, `-v`, `-m` to match `pipeline.py`, `trainer.py`, and `predictor.py`.
+   - Updated CLI options sections to reflect short-form switches.
+
+3. **Extended Mode**:
+   - Added `-x` support for 1369-dimensional features.
+   - Included examples for both default (`features.pkl`, `weights/`) and extended (`training_data_x.pkl`, `weights_x/`) modes.
+   - Clarified feature file expectations (`features` vs `outer_product` columns).
+
+4. **File Naming**:
+   - Renamed scripts to match provided files: `compute_features.py` → `pipeline.py`, `train_models.py` → `trainer.py`, `predict_materials.py` → `predictor.py`.
+   - Updated data files: `Elemental_property_data.csv` → `PubChemElements_all.csv`, `Compound_property_data.xlsx` → `Compound_property_data.csv`.
+
+5. **Performance**:
+   - Kept metrics concise, focusing on key values (accuracy, RMSE, R²).
+   - Removed correlation metrics to simplify.
+
+---
+
+### **How to Use**
+
+1. **Test Commands**:
+   - Generate features:
+     ```bash
+     python pipeline.py -c data/Compound_property_data.csv -e data/PubChemElements_all.csv -o output/training_data_x.pkl -f output/features_x.pkl -d data/cifs -x
+     ```
+   - Train models:
+     ```bash
+     python trainer.py -f output/training_data_x.pkl -e data/PubChemElements_all.csv -w weights_x -t all -x
+     ```
+   - Predict:
+     ```bash
+     python predictor.py -f output/training_data_x.pkl -t all -s 90_10 -w weights_x -x -o predictions.json
+     ```
+2. **Verify Features**:
+   ```python
+   import pickle
+   import pandas as pd
+   with open('output/training_data_x.pkl', 'rb') as f:
+       data = pickle.load(f)
+   print("Columns:", data.columns.tolist())
+   print("Feature column:", 'outer_product' if 'outer_product' in data.columns else 'features')
+   print("Vector length:", len(data['outer_product' if 'outer_product' in data.columns else 'features'].iloc[0]))
+   ```
+
+---
+
+### **Troubleshooting**
+
+- **Feature Mismatch**:
+  - Error: `Expected 1369 features, got X`
+  - Fix: Use `-x` with `training_data_x.pkl` from `pipeline.py -x`.
+- **Model Not Found**:
+  - Error: `Weights directory 'weights_x' not found`
+  - Fix: Train with `trainer.py -x` into `weights_x/`.
+- **Dependencies**:
+  ```bash
+  pip install pandas numpy scikit-learn lightgbm scipy pymatgen matplotlib
+  ```
