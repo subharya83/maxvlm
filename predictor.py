@@ -543,22 +543,22 @@ def main():
         epilog="""
 Examples:
   # Predict all properties using 90:10 split model (default, 518 features)
-  python predictor.py --features data/features.pkl --task all --split 90_10
+  python predictor.py -f data/features.pkl -t all -s 90_10 -w weights
   
   # Predict all properties using extended features (1369 features)
-  python predictor.py --features data/training_data_x.pkl --task all --split 90_10 -x
+  python predictor.py -f data/training_data_x.pkl -t all -s 90_10 -w weights_x -x
   
   # Predict only magnetic ordering
-  python predictor.py --features data/features.csv --task ordering
+  python predictor.py -f data/features.csv -t ordering -w weights
   
   # Predict formation energy using 70:30 split model
-  python predictor.py --features data/features.pkl --task formation --split 70_30
+  python predictor.py -f data/features.pkl -t formation -s 70_30 -w weights
   
   # Save output to file
-  python predictor.py --features data/features.pkl --output predictions.json
+  python predictor.py -f data/features.pkl -t all -o predictions.json -w weights
   
   # Verbose output with full probabilities
-  python predictor.py --features data/features.pkl --verbose
+  python predictor.py -f data/features.pkl -t all -v -w weights
 
 Notes:
   - Default mode expects 518-dimensional vectors computed by pipeline.py
@@ -570,51 +570,51 @@ Notes:
         """
     )
     
-    parser.add_argument('--features', required=True,
+    parser.add_argument('-f', required=True,
                        help='Path to features file (.pkl or .csv)')
-    parser.add_argument('--task', choices=MaterialsPredictor.VALID_TASKS,
+    parser.add_argument('-t', choices=MaterialsPredictor.VALID_TASKS,
                        default='all',
                        help='Prediction task (default: all)')
-    parser.add_argument('--split', choices=MaterialsPredictor.VALID_SPLITS,
+    parser.add_argument('-s', choices=MaterialsPredictor.VALID_SPLITS,
                        default='90_10',
                        help='Train/test split model to use (default: 90_10)')
-    parser.add_argument('--weights-dir', default='weights',
+    parser.add_argument('-w', default='weights',
                        help='Directory containing model weights (default: weights)')
-    parser.add_argument('--extended', '-x', action='store_true',
+    parser.add_argument('-x', action='store_true',
                        help='Use extended feature mode (1369 dimensions)')
-    parser.add_argument('--output', '-o',
+    parser.add_argument('-o',
                        help='Output file for predictions (.json or .csv)')
-    parser.add_argument('--verbose', '-v', action='store_true',
+    parser.add_argument('-v', action='store_true',
                        help='Verbose output with full probabilities')
-    parser.add_argument('--max-display', type=int, default=10,
+    parser.add_argument('-m', type=int, default=10,
                        help='Maximum number of results to display (default: 10)')
     
     args = parser.parse_args()
     
     # Check if features file exists
-    if not os.path.exists(args.features):
-        logger.error(f"Features file '{args.features}' not found")
+    if not os.path.exists(args.f):
+        logger.error(f"Features file '{args.f}' not found")
         sys.exit(1)
     
     # Initialize predictor
     print(f"\nInitializing Materials Predictor...")
-    print(f"Weights directory: {args.weights_dir}")
-    print(f"Model split: {args.split}")
-    print(f"Task: {args.task}")
-    print(f"Feature mode: {'extended (1369 features)' if args.extended else 'default (518 features)'}\n")
+    print(f"Weights directory: {args.w}")
+    print(f"Model split: {args.s}")
+    print(f"Task: {args.t}")
+    print(f"Feature mode: {'extended (1369 features)' if args.x else 'default (518 features)'}\n")
     
     try:
-        predictor = MaterialsPredictor(weights_dir=args.weights_dir, extended=args.extended)
+        predictor = MaterialsPredictor(weights_dir=args.w, extended=args.x)
     except ModelLoadError as e:
         logger.error(str(e))
         sys.exit(1)
     
     # Make predictions
-    logger.info(f"Making predictions from {args.features}...")
+    logger.info(f"Making predictions from {args.f}...")
     results = predictor.predict_from_features_file(
-        args.features,
-        task=args.task,
-        split=args.split
+        args.f,
+        task=args.t,
+        split=args.s
     )
     
     if results is None:
@@ -622,11 +622,11 @@ Notes:
         sys.exit(1)
     
     # Display results
-    display_results(results, verbose=args.verbose, max_display=args.max_display)
+    display_results(results, verbose=args.v, max_display=args.m)
     
     # Save output if requested
-    if args.output:
-        save_results(results, args.output)
+    if args.o:
+        save_results(results, args.o)
     
     print("\n✓ Done!")
 
