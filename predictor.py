@@ -4,15 +4,25 @@ Materials Property Predictor CLI
 Predicts magnetic ordering, magnetic moment, and formation energy for materials
 
 This module provides a command-line interface for making predictions using
-pre-trained LightGBM models. It expects feature vectors of dimension 518,
-computed using the pipeline.py feature extraction module.
+pre-trained LightGBM models. It supports two modes:
+- Default: Expects feature vectors of dimension 518, computed using pipeline.py.
+- Extended (-x): Expects feature vectors of dimension 1369, computed with -x option.
 
-Feature Vector Composition (518 dimensions):
+Feature Vector Composition (Default, 518 dimensions):
     - 256: Flattened mean of outer product matrices (16x16)
     - 256: Flattened std of outer product matrices (16x16)
-    - 2: Distance statistics (mean, std)
     - 2: Electronegativity difference statistics (mean, std)
     - 2: Squared electronegativity difference statistics (mean, std)
+    - 1: Coordination number (fixed at 12.0)
+    - 1: Placeholder for space group (default)
+
+Feature Vector Composition (Extended, 1369 dimensions):
+    - 1352: Flattened mean and std of outer product matrices (26x26x2)
+    - 4: Distance statistics (mean, std, min, max)
+    - 4: Electronegativity difference statistics (mean, std, min, max)
+    - 4: Coordination numbers (padded/truncated to 4 elements)
+    - 4: Lattice parameters (a, b, c, volume)
+    - 1: Space group number
 
 Models:
     - Magnetic Ordering: Binary classification (FM vs FiM)
@@ -20,7 +30,7 @@ Models:
     - Formation Energy: Regression (eV/atom)
 
 Author: Materials Prediction Pipeline
-Version: 2.0
+Version: 2.1
 """
 
 import argparse
@@ -66,24 +76,29 @@ class MaterialsPredictor:
         weights_dir (Path): Directory containing model weights
         models (Dict): Dictionary of loaded models
         element_df (Optional[pd.DataFrame]): Element feature database
-        expected_features (int): Expected number of input features (518)
+        expected_features (int): Expected number of input features (518 or 1369)
+        extended (bool): Whether to use extended feature mode
     """
     
-    EXPECTED_FEATURES = 518
+    DEFAULT_FEATURES = 518
+    EXTENDED_FEATURES = 1369
     VALID_SPLITS = ['90_10', '70_30']
     VALID_TASKS = ['all', 'ordering', 'moment', 'formation']
     
-    def __init__(self, weights_dir: str = 'weights'):
+    def __init__(self, weights_dir: str = 'weights', extended: bool = False):
         """
         Initialize the predictor by loading all models.
         
         Args:
             weights_dir: Directory containing model weights
+            extended: Use extended feature mode (1369 dimensions)
             
         Raises:
             ModelLoadError: If weights directory doesn't exist or no models found
         """
         self.weights_dir = Path(weights_dir)
+        self.extended = extended
+        self.expected_features = self.EXTENDED_FEATURES if extended else self.DEFAULT_FEATURES
         self.models: Dict[str, Any] = {}
         self.element_df: Optional[pd.DataFrame] = None
         self.load_all_models()
@@ -162,10 +177,11 @@ class MaterialsPredictor:
                 f"Features must be 2D array (samples, features), got shape {features.shape}"
             )
         
-        if features.shape[1] != self.EXPECTED_FEATURES:
+        if features.shape[1] != self.expected_features:
             raise FeatureValidationError(
-                f"Expected {self.EXPECTED_FEATURES} features, got {features.shape[1]}. "
-                "Ensure features are computed using the same pipeline configuration."
+                f"Expected {self.expected_features} features, got {features.shape[1]}. "
+                "Ensure features are computed using the same pipeline configuration "
+                f"({'extended' if self.extended else 'default'} mode)."
             )
         
         if np.isnan(features).any():
@@ -183,7 +199,7 @@ class MaterialsPredictor:
         Predict magnetic ordering (FM or FiM).
         
         Args:
-            features: Feature array of shape (n_samples, 518)
+            features: Feature array of shape (n_samples, expected_features)
             split: Model split to use ('90_10' or '70_30')
             
         Returns:
@@ -233,7 +249,7 @@ class MaterialsPredictor:
         Predict magnetic moment per atom.
         
         Args:
-            features: Feature array of shape (n_samples, 518)
+            features: Feature array of shape (n_samples, expected_features)
             split: Model split to use ('90_10' or '70_30')
             
         Returns:
@@ -272,7 +288,7 @@ class MaterialsPredictor:
         Predict formation energy per atom.
         
         Args:
-            features: Feature array of shape (n_samples, 518)
+            features: Feature array of shape (n_samples, expected_features)
             split: Model split to use ('90_10' or '70_30')
             
         Returns:
@@ -345,15 +361,19 @@ class MaterialsPredictor:
         
         results = []
         
-        # Handle pickle format (DataFrame with 'features' column)
-        if isinstance(data, pd.DataFrame) and 'features' in data.columns:
+        # Handle pickle format (DataFrame with 'features' or 'outer_product' column)
+        if isinstance(data, pd.DataFrame) and ('features' in data.columns or 'outer_product' in data.columns):
+            feature_col = 'outer_product' if self.extended else 'features'
+            if feature_col not in data.columns:
+                logger.error(f"Expected '{feature_col}' column in features file for {'extended' if self.extended else 'default'} mode")
+                return None
             logger.info(f"Processing {len(data)} materials from pickle format")
             
             for idx, row in data.iterrows():
                 material_id = row.get('material_id', f'material_{idx}')
                 
                 try:
-                    feature_vector = np.array(row['features']).reshape(1, -1)
+                    feature_vector = np.array(row[feature_col]).reshape(1, -1)
                     result = self._predict_single(material_id, feature_vector, task, split)
                     results.append(result)
                 except Exception as e:
@@ -366,11 +386,12 @@ class MaterialsPredictor:
             
             feature_cols = [col for col in data.columns if col != 'material_id']
             
-            if len(feature_cols) != self.EXPECTED_FEATURES:
-                logger.warning(
-                    f"Expected {self.EXPECTED_FEATURES} feature columns, "
+            if len(feature_cols) != self.expected_features:
+                logger.error(
+                    f"Expected {self.expected_features} feature columns, "
                     f"found {len(feature_cols)}"
                 )
+                return None
             
             for idx, row in data.iterrows():
                 material_id = row.get('material_id', f'material_{idx}')
@@ -521,8 +542,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Predict all properties using 90:10 split model
+  # Predict all properties using 90:10 split model (default, 518 features)
   python predictor.py --features data/features.pkl --task all --split 90_10
+  
+  # Predict all properties using extended features (1369 features)
+  python predictor.py --features data/training_data_x.pkl --task all --split 90_10 -x
   
   # Predict only magnetic ordering
   python predictor.py --features data/features.csv --task ordering
@@ -537,7 +561,9 @@ Examples:
   python predictor.py --features data/features.pkl --verbose
 
 Notes:
-  - Features must be 518-dimensional vectors computed by pipeline.py
+  - Default mode expects 518-dimensional vectors computed by pipeline.py
+  - Extended mode (-x) expects 1369-dimensional vectors computed by pipeline.py -x
+  - Models must be trained with the same mode (default or extended) as features
   - Models are trained on FM and FiM magnetic materials only
   - 90:10 split typically provides better generalization
   - 70:30 split may be more conservative (higher regularization)
@@ -554,6 +580,8 @@ Notes:
                        help='Train/test split model to use (default: 90_10)')
     parser.add_argument('--weights-dir', default='weights',
                        help='Directory containing model weights (default: weights)')
+    parser.add_argument('--extended', '-x', action='store_true',
+                       help='Use extended feature mode (1369 dimensions)')
     parser.add_argument('--output', '-o',
                        help='Output file for predictions (.json or .csv)')
     parser.add_argument('--verbose', '-v', action='store_true',
@@ -572,10 +600,11 @@ Notes:
     print(f"\nInitializing Materials Predictor...")
     print(f"Weights directory: {args.weights_dir}")
     print(f"Model split: {args.split}")
-    print(f"Task: {args.task}\n")
+    print(f"Task: {args.task}")
+    print(f"Feature mode: {'extended (1369 features)' if args.extended else 'default (518 features)'}\n")
     
     try:
-        predictor = MaterialsPredictor(weights_dir=args.weights_dir)
+        predictor = MaterialsPredictor(weights_dir=args.weights_dir, extended=args.extended)
     except ModelLoadError as e:
         logger.error(str(e))
         sys.exit(1)
