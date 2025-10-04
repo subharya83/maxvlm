@@ -11,6 +11,7 @@ import argparse
 import pickle
 import numpy as np
 import pandas as pd
+import lightgbm
 from pathlib import Path
 from sklearn.model_selection import train_test_split, GridSearchCV
 from sklearn.preprocessing import StandardScaler
@@ -135,9 +136,11 @@ def train_ordering_classifier(
             base_model, param_grid, cv=5, scoring='roc_auc', n_jobs=-1, return_train_score=True
         )
         try:
+            # Use early_stopping callback instead of early_stopping_rounds
             grid_search.fit(
-                X_train, y_train, eval_set=[(X_test, y_test)], eval_metric='auc',
-                early_stopping_rounds=10, verbose=False
+                X_train, y_train,
+                **{'eval_set': [(X_test, y_test)], 'eval_metric': 'auc',
+                   'callbacks': [lightgbm.early_stopping(stopping_rounds=10, verbose=False)]}
             )
             model = grid_search.best_estimator_
             logger.info(f"Best parameters: {grid_search.best_params_}")
@@ -145,8 +148,9 @@ def train_ordering_classifier(
             X_train = X_train[:, selected_features]
             X_test = X_test[:, selected_features]
             model.fit(
-                X_train, y_train, eval_set=[(X_test, y_test)], eval_metric='auc',
-                early_stopping_rounds=10, verbose=False
+                X_train, y_train,
+                eval_set=[(X_test, y_test)], eval_metric='auc',
+                callbacks=[lightgbm.early_stopping(stopping_rounds=10, verbose=False)]
             )
         except Exception as e:
             raise TrainingError(f"Model training failed: {e}")
@@ -225,8 +229,9 @@ def train_moment_regressor(
         )
         try:
             grid_search.fit(
-                X_train, y_train, eval_set=[(X_test, y_test)], eval_metric='rmse',
-                early_stopping_rounds=10, verbose=False
+                X_train, y_train,
+                **{'eval_set': [(X_test, y_test)], 'eval_metric': 'rmse',
+                   'callbacks': [lightgbm.early_stopping(stopping_rounds=10, verbose=False)]}
             )
             model = grid_search.best_estimator_
             logger.info(f"Best parameters: {grid_search.best_params_}")
@@ -234,8 +239,9 @@ def train_moment_regressor(
             X_train = X_train[:, selected_features]
             X_test = X_test[:, selected_features]
             model.fit(
-                X_train, y_train, eval_set=[(X_test, y_test)], eval_metric='rmse',
-                early_stopping_rounds=10, verbose=False
+                X_train, y_train,
+                eval_set=[(X_test, y_test)], eval_metric='rmse',
+                callbacks=[lightgbm.early_stopping(stopping_rounds=10, verbose=False)]
             )
         except Exception as e:
             raise TrainingError(f"Model training failed: {e}")
@@ -317,8 +323,9 @@ def train_formation_regressor(
         )
         try:
             grid_search.fit(
-                X_train, y_train, eval_set=[(X_test, y_test)], eval_metric='rmse',
-                early_stopping_rounds=10, verbose=False
+                X_train, y_train,
+                **{'eval_set': [(X_test, y_test)], 'eval_metric': 'rmse',
+                   'callbacks': [lightgbm.early_stopping(stopping_rounds=10, verbose=False)]}
             )
             model = grid_search.best_estimator_
             logger.info(f"Best parameters: {grid_search.best_params_}")
@@ -326,8 +333,9 @@ def train_formation_regressor(
             X_train = X_train[:, selected_features]
             X_test = X_test[:, selected_features]
             model.fit(
-                X_train, y_train, eval_set=[(X_test, y_test)], eval_metric='rmse',
-                early_stopping_rounds=10, verbose=False
+                X_train, y_train,
+                eval_set=[(X_test, y_test)], eval_metric='rmse',
+                callbacks=[lightgbm.early_stopping(stopping_rounds=10, verbose=False)]
             )
         except Exception as e:
             raise TrainingError(f"Model training failed: {e}")
@@ -354,7 +362,7 @@ def train_formation_regressor(
     test_mae = mean_absolute_error(y_test, y_test_pred)
     train_r2 = r2_score(y_train, y_train_pred)
     test_r2 = r2_score(y_test, y_test_pred)
-    train_corr, _ = pearsonr(y_train, y_train_pred)
+    train_corr, _ = pearsonr(y_train, y_test_pred)
     test_corr, _ = pearsonr(y_test, y_test_pred)
     metrics = {
         'train_rmse': train_rmse, 'test_rmse': test_rmse,
